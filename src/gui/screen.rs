@@ -1208,9 +1208,9 @@ impl MainScreen {
                 let folder_id = section.folder_id.clone();
 
                 let header_content = row![
-                    text(chevron).size(12).color(TeamsDark::TEXT_MUTED),
+                    text(chevron).size(13).color(TeamsDark::TEXT_MUTED),
                     text(section.name.clone())
-                        .size(12)
+                        .size(13)
                         .color(TeamsDark::TEXT_MUTED)
                         .font(Font::with_name("Fira Sans")),
                     iced::widget::Space::new().width(Length::Fill),
