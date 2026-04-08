@@ -1,0 +1,40 @@
+[package]
+name = "teams-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+default-run = "teams-rs"
+
+[dependencies]
+# GUI
+iced = { version = "0.14", features = ["tokio"] }
+
+# HTTP
+reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
+
+# Keychain
+keyring = { version = "3", features = ["apple-native"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime (iced with tokio feature uses this)
+tokio = { version = "1", features = ["full"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# URL handling
+url = "2"
+urlencoding = "2"
+
+# Browser-based auth (visible Chrome for SSO)
+headless_chrome = "1"
