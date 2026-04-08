@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use iced::widget::{center, column, row, scrollable, text, container, button, tooltip, Column};
 use iced::{Color, Element, Font, Length, Subscription, Task};
 
+use crate::gui::layout_tracker::{self, ChildPositions, LayoutTracker};
+
 use crate::api::client::GraphClient;
 use crate::api::csa::{CsaChat, CsaFolder, CsaFolderConversation, CsaLastMessage, CsaMember};
 use crate::api::csa::CsaUpdatesResponse;
@@ -40,6 +42,117 @@ pub struct ParsedMessage {
     pub content: String,
     pub timestamp: String,
     pub is_from_me: bool,
+}
+
+/// A group of consecutive messages from the same sender.
+/// Used for sticky sender name calculation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SenderGroup {
+    /// Index into the chronological message list where this group starts
+    pub start_index: usize,
+    pub sender_name: String,
+    pub is_from_me: bool,
+}
+
+/// Compute sender groups from chronologically ordered messages.
+/// Messages must be in chronological order (oldest first).
+/// A new group starts when the sender changes OR when the date changes
+/// (mirroring date separator behavior in the view).
+pub fn compute_sender_groups(messages: &[ParsedMessage]) -> Vec<SenderGroup> {
+    let mut groups = Vec::new();
+    let mut last_sender: Option<&str> = None;
+    let mut last_date: Option<&str> = None;
+
+    for (i, msg) in messages.iter().enumerate() {
+        let msg_date = extract_date(&msg.timestamp);
+        let date_changed = last_date.is_some() && last_date != Some(msg_date);
+        let sender_changed = last_sender != Some(&msg.sender_name);
+
+        if sender_changed || date_changed {
+            groups.push(SenderGroup {
+                start_index: i,
+                sender_name: msg.sender_name.clone(),
+                is_from_me: msg.is_from_me,
+            });
+        }
+
+        last_sender = Some(&msg.sender_name);
+        last_date = Some(msg_date);
+    }
+
+    groups
+}
+
+/// Determine which sender group is "sticky" at a given scroll offset.
+/// Returns None if the name row of the current group is still visible
+/// (to avoid showing it twice).
+///
+/// With `anchor_bottom()`:
+///   - relative_y=0.0 → bottom (newest messages)
+///   - relative_y=1.0 → top (oldest messages)
+/// Groups are chronological (index 0 = oldest).
+///
+/// Uses proportional mapping: relative scroll position maps linearly to
+/// message index. This avoids pixel-height estimation which is unreliable
+/// with variable row heights.
+pub fn sticky_sender_at_offset<'a>(
+    groups: &'a [SenderGroup],
+    total_messages: usize,
+    relative_y: f32,        // 0.0 = bottom, 1.0 = top (anchor_bottom semantics)
+    _viewport_height: f32,
+    _content_height: f32,
+) -> Option<&'a SenderGroup> {
+    if groups.is_empty() || total_messages == 0 {
+        return None;
+    }
+
+    // Proportional mapping: relative_y maps linearly to message index.
+    // relative_y=1.0 (top) → index 0 (oldest)
+    // relative_y=0.0 (bottom) → index total_messages-1 (newest)
+    let fraction_from_top = 1.0 - relative_y; // 0.0 at top, 1.0 at bottom
+    let top_index = ((fraction_from_top * total_messages as f32).floor() as usize)
+        .min(total_messages.saturating_sub(1));
+
+    // Find the group that contains top_index
+    let mut current_group_idx = 0;
+    for (gi, group) in groups.iter().enumerate() {
+        if group.start_index <= top_index {
+            current_group_idx = gi;
+        } else {
+            break;
+        }
+    }
+
+    let group = &groups[current_group_idx];
+
+    // Don't show sticky if we're looking at the very first messages of this group
+    // (the name row itself is visible)
+    if top_index <= group.start_index {
+        return None;
+    }
+
+    Some(group)
+}
+
+/// Precompute the number of date separators before each message index.
+/// This mirrors the date separator logic in the view.
+pub fn compute_date_separator_counts(messages: &[ParsedMessage]) -> Vec<usize> {
+    let mut counts = Vec::with_capacity(messages.len());
+    let mut total = 0usize;
+    let mut last_date: Option<&str> = None;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    for msg in messages {
+        let msg_date = extract_date(&msg.timestamp);
+        let date_changed = last_date.is_some() && last_date != Some(msg_date);
+        if date_changed && !msg_date.is_empty() && msg_date != today {
+            total += 1;
+        }
+        counts.push(total);
+        last_date = Some(msg_date);
+    }
+
+    counts
 }
 
 /// Visual properties for rendering a single chat row — testable without iced widgets.
@@ -400,6 +513,19 @@ pub struct MainScreen {
     renaming_chat: bool,
     /// Current text in the rename input
     rename_value: String,
+    /// Precomputed sender groups for sticky sender name
+    sender_groups: Vec<SenderGroup>,
+    /// Precomputed date separator counts per message index
+    date_separator_counts: Vec<usize>,
+    /// Currently sticky sender (name, is_from_me) — shown as overlay
+    sticky_sender: Option<(String, bool)>,
+    /// Last known absolute scroll offset (pixels from top of content)
+    last_scroll_offset: f32,
+    /// Shared child Y positions from LayoutTracker widget
+    child_positions: ChildPositions,
+    /// Sender info per row: (sender_name, is_from_me) for each child in the Column.
+    /// Built during recompute_sender_groups(), indexed in parallel with child_positions.
+    row_senders: Vec<(String, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -474,9 +600,90 @@ impl MainScreen {
                 custom_chat_names: load_custom_names(),
                 renaming_chat: false,
                 rename_value: String::new(),
+                sender_groups: vec![],
+                date_separator_counts: vec![],
+                sticky_sender: None,
+                last_scroll_offset: 0.0,
+                child_positions: layout_tracker::child_positions(),
+                row_senders: vec![],
             },
             task,
         )
+    }
+
+    /// Recompute sender groups and row_senders from current messages.
+    /// Call this whenever `self.messages` changes.
+    fn recompute_sender_groups(&mut self) {
+        // Messages are stored newest-first, sender groups need chronological order
+        let chronological: Vec<ParsedMessage> = self.messages.iter().rev().cloned().collect();
+        self.sender_groups = compute_sender_groups(&chronological);
+        self.date_separator_counts = compute_date_separator_counts(&chronological);
+
+        // Build row_senders: one entry per child in the scrollable Column.
+        // This mirrors the view's rendering order exactly so that
+        // row_senders[i] corresponds to child_positions[i].
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let mut row_senders: Vec<(String, bool)> = Vec::new();
+        let mut last_date: Option<&str> = None;
+
+        // Loading indicator row
+        if self.loading_older {
+            row_senders.push((String::new(), false));
+        }
+
+        for msg in &chronological {
+            let msg_date = extract_date(&msg.timestamp);
+            let date_changed = last_date.is_some() && last_date != Some(msg_date);
+            if date_changed && !msg_date.is_empty() && msg_date != today {
+                // Date separator row
+                row_senders.push((String::new(), false));
+            }
+            last_date = Some(msg_date);
+
+            // Message row
+            row_senders.push((msg.sender_name.clone(), msg.is_from_me));
+        }
+        self.row_senders = row_senders;
+
+        // Recalculate sticky from last known scroll position
+        self.recalc_sticky();
+    }
+
+    /// Recalculate sticky sender using EXACT child positions from LayoutTracker.
+    /// `child_positions` has the real Y-offset of each child in the Column.
+    /// `last_scroll_offset` has the scrollable's absolute offset (pixels from top).
+    /// Combined, we find exactly which row is at the viewport top.
+    fn recalc_sticky(&mut self) {
+        let positions = self.child_positions.borrow();
+        if positions.is_empty() || self.row_senders.is_empty() {
+            self.sticky_sender = None;
+            return;
+        }
+
+        // Find the topmost visible child
+        let top_idx = match layout_tracker::top_visible_child(&positions, self.last_scroll_offset) {
+            Some(idx) => idx,
+            None => { self.sticky_sender = None; return; }
+        };
+
+        // Don't show sticky if we're at the very top
+        if top_idx == 0 && self.last_scroll_offset < 5.0 {
+            self.sticky_sender = None;
+            return;
+        }
+
+        // Walk backwards from top_idx to find the sender
+        // (skip date separators which have empty sender_name)
+        let limit = top_idx.min(self.row_senders.len().saturating_sub(1));
+        for i in (0..=limit).rev() {
+            let (ref name, is_me) = self.row_senders[i];
+            if !name.is_empty() {
+                self.sticky_sender = Some((name.clone(), is_me));
+                return;
+            }
+        }
+
+        self.sticky_sender = None;
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -796,6 +1003,7 @@ impl MainScreen {
                 self.loading_older = false;
                 self.renaming_chat = false;
                 self.messages_error = None;
+                self.recompute_sender_groups();
 
                 let c = self.client.clone();
                 Task::perform(
@@ -815,6 +1023,7 @@ impl MainScreen {
                 self.messages = msgs;
                 self.backward_link = blink;
                 self.messages_error = None;
+                self.recompute_sender_groups();
                 Task::none()
             }
             Message::MessagesLoaded(Err(e)) => {
@@ -949,6 +1158,7 @@ impl MainScreen {
                 let mut combined = older_msgs;
                 combined.extend(self.messages.drain(..));
                 self.messages = combined;
+                self.recompute_sender_groups();
                 Task::none()
             }
             Message::OlderMessagesLoaded(Err(e)) => {
@@ -999,12 +1209,21 @@ impl MainScreen {
                     self.messages.truncate(older_count);
                     self.messages.extend(new_msgs);
                 }
+                self.recompute_sender_groups();
                 Task::none()
             }
             Message::PollMessagesLoaded(Err(_)) => Task::none(),
             Message::ScrollChanged(viewport) => {
                 // With anchor_bottom, absolute_offset_reversed().y == 0 means we're at the very top
                 let dist_from_top = viewport.absolute_offset_reversed().y;
+
+                // Save scroll offset for sticky recalculation
+                // absolute_offset_reversed().y = pixels scrolled from content top
+                self.last_scroll_offset = dist_from_top;
+
+                // Recalculate sticky sender using exact child positions from LayoutTracker
+                self.recalc_sticky();
+
                 // Auto-load when near top (200px threshold for no delay)
                 if dist_from_top < 200.0
                     && !self.loading_older
@@ -1311,19 +1530,33 @@ impl MainScreen {
                 .style(header_style)
                 .into())
             } else {
-                // Normal mode: clickable text
+                // Normal mode: clickable chat name + selectable conversation ID below
+                let chat_id_str = self.selected_chat_id.as_deref().unwrap_or("");
                 tid("H01", container(
-                    button(
-                        text(chat_name).size(18).color(TeamsDark::TEXT_PRIMARY)
-                    )
-                    .on_press(Message::RenameStart)
-                    .width(Length::Fill)
-                    .style(|_theme, _status| iced::widget::button::Style {
-                        background: None,
-                        text_color: TeamsDark::TEXT_PRIMARY,
-                        border: iced::Border::default(),
-                        ..Default::default()
-                    })
+                    column![
+                        button(
+                            text(chat_name).size(18).color(TeamsDark::TEXT_PRIMARY)
+                        )
+                        .on_press(Message::RenameStart)
+                        .width(Length::Fill)
+                        .style(|_theme, _status| iced::widget::button::Style {
+                            background: None,
+                            text_color: TeamsDark::TEXT_PRIMARY,
+                            border: iced::Border::default(),
+                            ..Default::default()
+                        }),
+                        iced::widget::text_input("", chat_id_str)
+                            .size(10)
+                            .style(|_theme, _status| iced::widget::text_input::Style {
+                                background: iced::Background::Color(Color::TRANSPARENT),
+                                border: iced::Border::default(),
+                                icon: TeamsDark::TEXT_MUTED,
+                                placeholder: TeamsDark::TEXT_MUTED,
+                                value: TeamsDark::TEXT_MUTED,
+                                selection: TeamsDark::ACCENT,
+                            })
+                    ]
+                    .spacing(2)
                 )
                 .padding(12)
                 .width(Length::Fill)
@@ -1361,16 +1594,6 @@ impl MainScreen {
                 let name_col_w: f32 = (max_name_chars as f32) * 7.5 + 12.0;
                 let time_col_w: f32 = 50.0; // fits "HH:MM"
 
-                // Debug border style for layout visualization
-                let debug_border = |_theme: &iced::Theme| container::Style {
-                    border: iced::Border {
-                        color: Color::from_rgb(0.4, 0.4, 0.4),
-                        width: 1.0,
-                        radius: 0.0.into(),
-                    },
-                    ..Default::default()
-                };
-
                 let mut msg_widgets: Vec<Element<'_, Message>> = Vec::new();
 
                 // Loading indicator at top while fetching older messages
@@ -1390,7 +1613,7 @@ impl MainScreen {
                 let mut last_date: Option<&str> = None;
                 let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
-                for msg in &sorted_msgs {
+                for msg in sorted_msgs.iter() {
                     // Date separator: centered line when date changes (not today)
                     let msg_date = extract_date(&msg.timestamp);
                     let date_changed = last_date != Some(msg_date);
@@ -1422,16 +1645,15 @@ impl MainScreen {
                         Color::from_rgb(0.7, 0.85, 0.55)
                     };
 
-                    // Col 1: Name
+                    // Col 1: Sender name — only shown on sender change (group header)
                     let name_text: Element<'_, Message> = if show_name {
                         text(&msg.sender_name).size(12).color(name_color).into()
                     } else {
-                        text("").size(12).into()
+                        text("").into()
                     };
                     let col1: Element<'_, Message> = container(name_text)
                         .width(name_col_w)
                         .padding([2, 4])
-                        .style(debug_border)
                         .into();
 
                     // Col 2: Time
@@ -1440,7 +1662,6 @@ impl MainScreen {
                     )
                     .width(time_col_w)
                     .padding([2, 4])
-                    .style(debug_border)
                     .into();
 
                     // Col 3: Message
@@ -1448,24 +1669,62 @@ impl MainScreen {
                         text(&msg.content).size(13).color(TeamsDark::TEXT_PRIMARY)
                     )
                     .padding([2, 4])
-                    .style(debug_border)
                     .into();
 
                     let msg_row = iced::widget::Row::with_children(vec![col1, col2, col3])
                         .spacing(0);
 
-                    msg_widgets.push(tid("M01", msg_row.into()));
+                    msg_widgets.push(msg_row.into());
                 }
 
-                scrollable(
-                    Column::with_children(msg_widgets)
-                        .spacing(2)
-                        .padding(12)
-                        .width(Length::Fill)
-                )
-                .on_scroll(Message::ScrollChanged)
+                // Wrap the message column in a LayoutTracker to get exact child Y positions
+                let msg_column = Column::with_children(msg_widgets)
+                    .spacing(2)
+                    .padding(12)
+                    .width(Length::Fill);
+
+                let tracked: Element<'_, Message> = LayoutTracker::new(
+                    msg_column.into(),
+                    self.child_positions.clone(),
+                ).into();
+
+                let msg_scrollable = scrollable(tracked)
+                    .on_scroll(Message::ScrollChanged)
+                    .height(Length::Fill)
+                    .anchor_bottom();
+
+                // Sticky sender name overlay
+                let sticky_overlay: Element<'_, Message> = if let Some((ref name, is_me)) = self.sticky_sender {
+                    let color = if is_me {
+                        Color::from_rgb(0.55, 0.65, 1.0)
+                    } else {
+                        Color::from_rgb(0.7, 0.85, 0.55)
+                    };
+                    container(
+                        container(
+                            text(name).size(12).color(color)
+                        )
+                        .width(name_col_w)
+                        .padding([2, 4])
+                        .style(|_theme: &iced::Theme| container::Style {
+                            background: Some(iced::Background::Color(TeamsDark::BACKGROUND)),
+                            ..Default::default()
+                        })
+                    )
+                    .padding(12)
+                    .width(Length::Fill)
+                    .align_top(Length::Fill)
+                    .into()
+                } else {
+                    container("").width(0).height(0).into()
+                };
+
+                iced::widget::Stack::with_children(vec![
+                    msg_scrollable.into(),
+                    sticky_overlay,
+                ])
+                .width(Length::Fill)
                 .height(Length::Fill)
-                .anchor_bottom()
                 .into()
             };
 
@@ -2804,5 +3063,163 @@ mod tests {
     fn parse_federated_profiles_invalid_json() {
         let result = parse_federated_profiles("not json");
         assert!(result.is_empty());
+    }
+
+    // ── SenderGroup / sticky sender ──────────────────────────────────
+
+    fn make_msg(sender: &str, is_me: bool, timestamp: &str) -> ParsedMessage {
+        ParsedMessage {
+            sender_name: sender.to_string(),
+            sender_id: if is_me { "me".into() } else { sender.to_lowercase() },
+            content: "test message".into(),
+            timestamp: timestamp.to_string(),
+            is_from_me: is_me,
+        }
+    }
+
+    #[test]
+    fn sender_groups_empty() {
+        let groups = compute_sender_groups(&[]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn sender_groups_single_sender() {
+        let msgs = vec![
+            make_msg("Alice", false, "2026-04-08T10:00:00Z"),
+            make_msg("Alice", false, "2026-04-08T10:01:00Z"),
+            make_msg("Alice", false, "2026-04-08T10:02:00Z"),
+        ];
+        let groups = compute_sender_groups(&msgs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].sender_name, "Alice");
+        assert_eq!(groups[0].start_index, 0);
+        assert!(!groups[0].is_from_me);
+    }
+
+    #[test]
+    fn sender_groups_alternating() {
+        let msgs = vec![
+            make_msg("Alice", false, "2026-04-08T10:00:00Z"),
+            make_msg("Bob", false, "2026-04-08T10:01:00Z"),
+            make_msg("Alice", false, "2026-04-08T10:02:00Z"),
+        ];
+        let groups = compute_sender_groups(&msgs);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].sender_name, "Alice");
+        assert_eq!(groups[0].start_index, 0);
+        assert_eq!(groups[1].sender_name, "Bob");
+        assert_eq!(groups[1].start_index, 1);
+        assert_eq!(groups[2].sender_name, "Alice");
+        assert_eq!(groups[2].start_index, 2);
+    }
+
+    #[test]
+    fn sender_groups_date_change_resets_group() {
+        let msgs = vec![
+            make_msg("Alice", false, "2026-04-07T23:59:00Z"),
+            make_msg("Alice", false, "2026-04-08T00:01:00Z"),
+        ];
+        let groups = compute_sender_groups(&msgs);
+        // Same sender but date changed → new group
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].start_index, 0);
+        assert_eq!(groups[1].start_index, 1);
+    }
+
+    #[test]
+    fn sender_groups_tracks_is_from_me() {
+        let msgs = vec![
+            make_msg("Me", true, "2026-04-08T10:00:00Z"),
+            make_msg("Alice", false, "2026-04-08T10:01:00Z"),
+        ];
+        let groups = compute_sender_groups(&msgs);
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].is_from_me);
+        assert!(!groups[1].is_from_me);
+    }
+
+    #[test]
+    fn sticky_empty_groups() {
+        let result = sticky_sender_at_offset(&[], 0, 0.0, 400.0, 1000.0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn sticky_at_bottom_no_sticky() {
+        // relative_y=0.0 → at the very bottom (newest messages visible)
+        // scroll_from_top = (1-0)*600 = 600, top_index = 600/100 = 6
+        // But let's use a scenario where bottom is the last group
+        let groups = vec![
+            SenderGroup { start_index: 0, sender_name: "Alice".into(), is_from_me: false },
+            SenderGroup { start_index: 5, sender_name: "Bob".into(), is_from_me: false },
+        ];
+        // 10 messages, relative_y=0 (bottom), content=1000, viewport=400
+        // scroll_from_top = (1-0)*600 = 600, avg_row=100, top_index=6 → in Bob's group, past start
+        let result = sticky_sender_at_offset(&groups, 10, 0.0, 400.0, 1000.0);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().sender_name, "Bob");
+    }
+
+    #[test]
+    fn sticky_at_top_shows_first_sender_or_none() {
+        // relative_y=1.0 → at the very top (oldest messages visible)
+        // scroll_from_top = (1-1)*600 = 0, top_index = 0 → at Alice's start → None
+        let groups = vec![
+            SenderGroup { start_index: 0, sender_name: "Alice".into(), is_from_me: false },
+            SenderGroup { start_index: 5, sender_name: "Bob".into(), is_from_me: false },
+        ];
+        let result = sticky_sender_at_offset(&groups, 10, 1.0, 400.0, 1000.0);
+        assert!(result.is_none(), "at very top, Alice's name row is visible → no sticky");
+    }
+
+    #[test]
+    fn sticky_scrolled_up_shows_current_sender() {
+        // Scrolling up from bottom: relative_y increases (toward top)
+        let groups = vec![
+            SenderGroup { start_index: 0, sender_name: "Alice".into(), is_from_me: false },
+            SenderGroup { start_index: 5, sender_name: "Bob".into(), is_from_me: true },
+        ];
+        // 10 msgs, relative_y=0.6 → fraction_from_top=0.4, top_index=4 → in Alice's group, past start
+        let result = sticky_sender_at_offset(&groups, 10, 0.6, 400.0, 1000.0);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().sender_name, "Alice");
+    }
+
+    #[test]
+    fn sticky_switches_group_when_scrolling_down() {
+        let groups = vec![
+            SenderGroup { start_index: 0, sender_name: "Alice".into(), is_from_me: false },
+            SenderGroup { start_index: 3, sender_name: "Bob".into(), is_from_me: true },
+        ];
+        // 10 msgs, relative_y=0.2 (near bottom)
+        // scroll_from_top = (1-0.2)*600 = 480, avg_row=100, top_index=4 → in Bob's group, past start
+        let result = sticky_sender_at_offset(&groups, 10, 0.2, 400.0, 1000.0);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().sender_name, "Bob");
+        assert!(result.unwrap().is_from_me);
+    }
+
+    #[test]
+    fn date_separator_counts_no_separators() {
+        let msgs = vec![
+            make_msg("Alice", false, "2026-04-08T10:00:00Z"),
+            make_msg("Bob", false, "2026-04-08T11:00:00Z"),
+        ];
+        let counts = compute_date_separator_counts(&msgs);
+        assert_eq!(counts, vec![0, 0]);
+    }
+
+    #[test]
+    fn date_separator_counts_with_date_change() {
+        let msgs = vec![
+            make_msg("Alice", false, "2026-04-06T10:00:00Z"),
+            make_msg("Alice", false, "2026-04-06T11:00:00Z"),
+            make_msg("Bob", false, "2026-04-07T09:00:00Z"),
+            make_msg("Bob", false, "2026-04-07T10:00:00Z"),
+        ];
+        let counts = compute_date_separator_counts(&msgs);
+        // First date change happens at index 2 (2026-04-06 → 2026-04-07)
+        assert_eq!(counts, vec![0, 0, 1, 1]);
     }
 }

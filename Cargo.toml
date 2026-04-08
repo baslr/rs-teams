@@ -7,7 +7,7 @@ default-run = "teams-rs"
 
 [dependencies]
 # GUI
-iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio", "advanced"] }
 
 # HTTP
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
