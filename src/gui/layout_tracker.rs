@@ -188,30 +188,53 @@ pub fn top_visible_child(child_y_positions: &[f32], scroll_offset: f32) -> Optio
     if lo > 0 { Some(lo - 1) } else { Some(0) }
 }
 
-/// Result of sticky header calculation.
+/// A single sticky header entry: sender index + viewport Y position.
 #[derive(Debug, Clone, PartialEq)]
-pub struct StickyState {
-    /// Index into row_senders of the current sticky sender.
+pub struct StickyEntry {
+    /// Index into row_senders of this sticky sender.
     pub sender_index: usize,
-    /// How many pixels to push the sticky label down from the top.
-    /// 0.0 = pinned at top (normal). >0 = being pushed down by the next header.
-    pub push_down: f32,
+    /// Y offset of the sticky label in the viewport (pixels from viewport top).
+    /// 0.0 = pinned at viewport top.
+    pub y_offset: f32,
 }
 
-/// Calculate the sticky header state: which sender is sticky and how much
-/// it should be pushed down by an incoming next-group header.
+/// Result of sticky header calculation — one primary + multiple outgoing stickies.
+///
+/// - `primary`: the sender pinned at (or near) the viewport top
+/// - `outgoing`: all subsequent sender-group headers that are visible in the
+///   viewport, each positioned at the first message row of their group
+///   (one row below the header row). These scroll with the content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StickyState {
+    /// The current sticky pinned at (or near) the viewport top.
+    pub primary: StickyEntry,
+    /// Sender stickies visible in the viewport below the primary.
+    /// Each is positioned at the first message of its group (row after the
+    /// sender-header row), scrolling naturally with the content.
+    pub outgoing: Vec<StickyEntry>,
+}
+
+/// Calculate the sticky header state with multi-sticky support.
+///
+/// Returns a primary sticky (pinned at viewport top) plus all subsequent
+/// sender-group headers that are currently visible in the viewport. Each
+/// outgoing sticky is positioned at the first message row of its group
+/// (one row below the header row), so it sits right where the sender's
+/// messages begin.
 ///
 /// `child_y_positions`: Y offset of each child row (from LayoutTracker)
 /// `row_senders`: (sender_name, is_from_me) per row; empty name = separator
 /// `scroll_offset`: pixels scrolled from top of content (absolute_offset_reversed)
-/// `sticky_height`: height of the sticky label in pixels (for push-down calc)
+/// `sticky_height`: height of the sticky label in pixels (unused currently, reserved)
+/// `viewport_height`: height of the visible viewport in pixels
 ///
 /// Returns None if no sticky should be shown (at very top, or no data).
 pub fn compute_sticky_state(
     child_y_positions: &[f32],
     row_senders: &[(String, bool)],
     scroll_offset: f32,
-    sticky_height: f32,
+    _sticky_height: f32,
+    viewport_height: f32,
 ) -> Option<StickyState> {
     if child_y_positions.is_empty() || row_senders.is_empty() {
         return None;
@@ -236,36 +259,45 @@ pub fn compute_sticky_state(
     }
     let sender_index = sender_index?;
 
-    // Find the NEXT group header after sender_index:
-    // scan forward from sender_index+1 to find the next row with a
-    // different non-empty sender name.
-    let current_sender = &row_senders[sender_index].0;
-    let mut next_header_y: Option<f32> = None;
+    // Primary sticky: the current sender, pinned at top
+    let group_start_y = child_y_positions[sender_index];
+    let natural_y = group_start_y - scroll_offset;
+    let primary_y = natural_y.max(0.0); // stick to top
+
+    // Collect ALL subsequent sender-group headers visible in the viewport.
+    // Each outgoing sticky is positioned at the FIRST MESSAGE of its group
+    // (one row below the header), not at the header itself.
+    let mut outgoing = Vec::new();
     let pos_len = child_y_positions.len();
+    let current_sender = &row_senders[sender_index].0;
+    let mut last_sender = current_sender.clone();
     for i in (sender_index + 1)..row_senders.len().min(pos_len) {
         let (ref name, _) = row_senders[i];
-        if !name.is_empty() && name != current_sender {
-            next_header_y = Some(child_y_positions[i]);
-            break;
+        if !name.is_empty() && name != &last_sender {
+            // Row i is the first message of a new sender group.
+            // Position the outgoing sticky at this row's Y position.
+            let viewport_y = child_y_positions[i] - scroll_offset;
+
+            if viewport_y >= viewport_height {
+                break; // off screen below — no more visible
+            }
+            if viewport_y > primary_y {
+                outgoing.push(StickyEntry {
+                    sender_index: i,
+                    y_offset: viewport_y,
+                });
+            }
+            last_sender = name.clone();
         }
     }
 
-    // Calculate push-down: if the next header is close to the viewport top,
-    // push the current sticky down so it appears to be "pushed" by the incoming header.
-    let push_down = if let Some(next_y) = next_header_y {
-        // Distance from viewport top to the next header
-        let gap = next_y - scroll_offset;
-        if gap < sticky_height {
-            // Next header is overlapping — push current sticky down
-            (sticky_height - gap).max(0.0)
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
-
-    Some(StickyState { sender_index, push_down })
+    Some(StickyState {
+        primary: StickyEntry {
+            sender_index,
+            y_offset: primary_y,
+        },
+        outgoing,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -329,77 +361,110 @@ mod tests {
         names.iter().map(|n| (n.to_string(), false)).collect()
     }
 
+    const VP: f32 = 400.0; // viewport height for tests
+
     #[test]
     fn sticky_state_empty() {
-        assert_eq!(compute_sticky_state(&[], &[], 0.0, 20.0), None);
+        assert_eq!(compute_sticky_state(&[], &[], 0.0, 20.0, VP), None);
     }
 
     #[test]
     fn sticky_state_at_top_no_sticky() {
         let positions = vec![0.0, 25.0, 50.0];
         let senders = senders(&["Alice", "", ""]);
-        assert_eq!(compute_sticky_state(&positions, &senders, 0.0, 20.0), None);
+        assert_eq!(compute_sticky_state(&positions, &senders, 0.0, 20.0, VP), None);
     }
 
     #[test]
-    fn sticky_state_scrolled_shows_sender() {
+    fn sticky_state_scrolled_shows_sender_with_outgoing() {
         // 3 rows from Alice, then 3 from Bob
+        // Row 0: Alice msg1, Row 1: Alice msg2, Row 2: Alice msg3
+        // Row 3: Bob msg1, Row 4: Bob msg2, Row 5: Bob msg3
         let positions = vec![0.0, 25.0, 50.0, 75.0, 100.0, 125.0];
         let senders = senders(&["Alice", "", "", "Bob", "", ""]);
-        // Scrolled to 30px — past Alice's header, still in Alice's group
-        let state = compute_sticky_state(&positions, &senders, 30.0, 20.0);
-        assert_eq!(state, Some(StickyState { sender_index: 0, push_down: 0.0 }));
+        // Scrolled to 30px — Alice sticks to top
+        let state = compute_sticky_state(&positions, &senders, 30.0, 20.0, VP).unwrap();
+        assert_eq!(state.primary.sender_index, 0); // Alice
+        assert_eq!(state.primary.y_offset, 0.0); // pinned
+        // Bob's first message is row 3 (y=75), viewport_y = 75-30 = 45
+        assert_eq!(state.outgoing.len(), 1);
+        assert_eq!(state.outgoing[0].sender_index, 3);
+        assert_eq!(state.outgoing[0].y_offset, 45.0);
     }
 
     #[test]
-    fn sticky_state_no_push_when_next_header_far() {
+    fn sticky_state_no_outgoing_when_next_header_off_screen() {
         let positions = vec![0.0, 25.0, 50.0, 75.0, 100.0, 125.0];
         let senders = senders(&["Alice", "", "", "Bob", "", ""]);
-        // Scrolled to 30px, next header (Bob) at 75px → gap=45, sticky_h=20 → no push
-        let state = compute_sticky_state(&positions, &senders, 30.0, 20.0).unwrap();
-        assert_eq!(state.push_down, 0.0);
+        // Scrolled to 80px — Bob is primary. No sender after Bob → no outgoing.
+        let state = compute_sticky_state(&positions, &senders, 80.0, 20.0, VP).unwrap();
+        assert_eq!(state.primary.sender_index, 3); // Bob
+        assert_eq!(state.primary.y_offset, 0.0); // pinned
+        assert!(state.outgoing.is_empty()); // no sender after Bob
     }
 
     #[test]
-    fn sticky_state_push_down_when_next_header_close() {
-        let positions = vec![0.0, 25.0, 50.0, 75.0, 100.0, 125.0];
-        let senders = senders(&["Alice", "", "", "Bob", "", ""]);
-        // Scrolled to 60px, next header (Bob) at 75px → gap=15, sticky_h=20 → push=5
-        let state = compute_sticky_state(&positions, &senders, 60.0, 20.0).unwrap();
-        assert_eq!(state.sender_index, 0); // still Alice
-        assert_eq!(state.push_down, 5.0);
+    fn sticky_state_multiple_outgoing_visible() {
+        // Alice rows 0-2, Bob rows 3-5, Charlie rows 6-8
+        let positions = vec![0.0, 25.0, 50.0, 100.0, 125.0, 150.0, 200.0, 225.0, 250.0];
+        let senders = senders(&["Alice", "", "", "Bob", "", "", "Charlie", "", ""]);
+        let state = compute_sticky_state(&positions, &senders, 10.0, 20.0, VP).unwrap();
+        assert_eq!(state.primary.sender_index, 0); // Alice
+        // Bob first msg at row 3 (y=100), viewport_y=90
+        // Charlie first msg at row 6 (y=200), viewport_y=190
+        assert_eq!(state.outgoing.len(), 2);
+        assert_eq!(state.outgoing[0].sender_index, 3); // Bob
+        assert_eq!(state.outgoing[0].y_offset, 90.0);
+        assert_eq!(state.outgoing[1].sender_index, 6); // Charlie
+        assert_eq!(state.outgoing[1].y_offset, 190.0);
+    }
+
+    #[test]
+    fn sticky_state_outgoing_stops_at_viewport_edge() {
+        // Alice rows 0-4, Bob rows 5-6, Charlie row 7. VP=400, scroll=10.
+        // Charlie's first msg at y=500, viewport_y=490 > 400 → off screen
+        let positions = vec![0.0, 25.0, 50.0, 75.0, 100.0, 500.0, 525.0, 600.0];
+        let senders = senders(&["Alice", "", "", "", "", "Bob", "", "Charlie"]);
+        let state = compute_sticky_state(&positions, &senders, 10.0, 20.0, VP).unwrap();
+        assert_eq!(state.primary.sender_index, 0);
+        // Bob at viewport 500-10=490 > 400 → off screen
+        assert!(state.outgoing.is_empty());
     }
 
     #[test]
     fn sticky_state_switches_to_next_sender() {
         let positions = vec![0.0, 25.0, 50.0, 75.0, 100.0, 125.0];
         let senders = senders(&["Alice", "", "", "Bob", "", ""]);
-        // Scrolled to 80px — past Bob's header at 75px → Bob is now sticky
-        let state = compute_sticky_state(&positions, &senders, 80.0, 20.0).unwrap();
-        assert_eq!(state.sender_index, 3); // Bob
-        assert_eq!(state.push_down, 0.0); // no next header pushing
+        // Scrolled to 80px — past Bob's header at 75px → Bob is primary
+        let state = compute_sticky_state(&positions, &senders, 80.0, 20.0, VP).unwrap();
+        assert_eq!(state.primary.sender_index, 3); // Bob
+        assert_eq!(state.primary.y_offset, 0.0);
+        assert!(state.outgoing.is_empty()); // no sender after Bob
     }
 
     #[test]
     fn sticky_state_with_date_separator() {
-        // Rows: Alice, Alice, [date sep], Bob, Bob
         let positions = vec![0.0, 25.0, 50.0, 80.0, 105.0];
         let senders = senders(&["Alice", "", "", "Bob", ""]);
-        // Scrolled to 30px — in Alice's group
-        let state = compute_sticky_state(&positions, &senders, 30.0, 20.0).unwrap();
-        assert_eq!(state.sender_index, 0); // Alice
-        // Next header (Bob) at 80px, gap=50, no push
-        assert_eq!(state.push_down, 0.0);
+        let state = compute_sticky_state(&positions, &senders, 30.0, 20.0, VP).unwrap();
+        assert_eq!(state.primary.sender_index, 0); // Alice
+        assert_eq!(state.primary.y_offset, 0.0);
+        // Bob first msg at row 3 (y=80), viewport_y=50
+        assert_eq!(state.outgoing.len(), 1);
+        assert_eq!(state.outgoing[0].sender_index, 3);
+        assert_eq!(state.outgoing[0].y_offset, 50.0);
     }
 
     #[test]
-    fn sticky_state_push_down_with_separator() {
-        // Rows: Alice, Alice, [date sep], Bob, Bob
-        let positions = vec![0.0, 25.0, 50.0, 80.0, 105.0];
-        let senders = senders(&["Alice", "", "", "Bob", ""]);
-        // Scrolled to 65px → gap to Bob at 80px = 15, sticky_h=20 → push=5
-        let state = compute_sticky_state(&positions, &senders, 65.0, 20.0).unwrap();
-        assert_eq!(state.sender_index, 0); // still Alice
-        assert_eq!(state.push_down, 5.0);
+    fn sticky_state_outgoing_position_at_first_message() {
+        // Row 0: Alice msg1 (y=0), Row 1: Alice msg2 (y=30), Row 2: Alice msg3 (y=60)
+        // Row 3: Bob msg1 (y=90), Row 4: Bob msg2 (y=120), Row 5: Bob msg3 (y=150)
+        let positions = vec![0.0, 30.0, 60.0, 90.0, 120.0, 150.0];
+        let senders = senders(&["Alice", "", "", "Bob", "", ""]);
+        let state = compute_sticky_state(&positions, &senders, 10.0, 20.0, VP).unwrap();
+        // Bob's first message is row 3 (y=90), viewport_y = 90-10 = 80
+        assert_eq!(state.outgoing.len(), 1);
+        assert_eq!(state.outgoing[0].sender_index, 3); // Bob
+        assert_eq!(state.outgoing[0].y_offset, 80.0);
     }
 }

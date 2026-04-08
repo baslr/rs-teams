@@ -144,7 +144,9 @@ pub fn compute_date_separator_counts(messages: &[ParsedMessage]) -> Vec<usize> {
 
     for msg in messages {
         let msg_date = extract_date(&msg.timestamp);
-        let date_changed = last_date.is_some() && last_date != Some(msg_date);
+        // Must match the view's date separator logic EXACTLY:
+        // View uses: last_date != Some(msg_date)
+        let date_changed = last_date != Some(msg_date);
         if date_changed && !msg_date.is_empty() && msg_date != today {
             total += 1;
         }
@@ -517,10 +519,14 @@ pub struct MainScreen {
     sender_groups: Vec<SenderGroup>,
     /// Precomputed date separator counts per message index
     date_separator_counts: Vec<usize>,
-    /// Currently sticky sender: (name, is_from_me, push_down_px)
-    sticky_sender: Option<(String, bool, f32)>,
+    /// Currently sticky sender: primary (name, is_from_me, y_offset, row_index)
+    sticky_sender: Option<(String, bool, f32, usize)>,
+    /// Outgoing stickies (sender headers visible in viewport below primary)
+    sticky_outgoing: Vec<(String, bool, f32, usize)>,
     /// Last known absolute scroll offset (pixels from top of content)
     last_scroll_offset: f32,
+    /// Last known viewport height (pixels)
+    last_viewport_height: f32,
     /// Shared child Y positions from LayoutTracker widget
     child_positions: ChildPositions,
     /// Sender info per row: (sender_name, is_from_me) for each child in the Column.
@@ -603,7 +609,9 @@ impl MainScreen {
                 sender_groups: vec![],
                 date_separator_counts: vec![],
                 sticky_sender: None,
+                sticky_outgoing: vec![],
                 last_scroll_offset: 0.0,
+                last_viewport_height: 600.0, // sensible default
                 child_positions: layout_tracker::child_positions(),
                 row_senders: vec![],
             },
@@ -633,7 +641,10 @@ impl MainScreen {
 
         for msg in &chronological {
             let msg_date = extract_date(&msg.timestamp);
-            let date_changed = last_date.is_some() && last_date != Some(msg_date);
+            // Must match the view's date separator logic EXACTLY:
+            // View uses: last_date != Some(msg_date)
+            // (which is true for the first message when last_date is None)
+            let date_changed = last_date != Some(msg_date);
             if date_changed && !msg_date.is_empty() && msg_date != today {
                 // Date separator row
                 row_senders.push((String::new(), false));
@@ -649,8 +660,8 @@ impl MainScreen {
         self.recalc_sticky();
     }
 
-    /// Recalculate sticky sender using EXACT child positions from LayoutTracker.
-    /// Uses compute_sticky_state() for the core logic including push-down effect.
+    /// Recalculate sticky sender(s) using EXACT child positions from LayoutTracker.
+    /// Uses compute_sticky_state() for the core logic including dual-sticky support.
     fn recalc_sticky(&mut self) {
         let positions = self.child_positions.borrow();
 
@@ -660,13 +671,22 @@ impl MainScreen {
             &self.row_senders,
             self.last_scroll_offset,
             sticky_height,
+            self.last_viewport_height,
         ) {
             Some(state) => {
-                let (ref name, is_me) = self.row_senders[state.sender_index];
-                self.sticky_sender = Some((name.clone(), is_me, state.push_down));
+                // Primary sticky
+                let (ref name, is_me) = self.row_senders[state.primary.sender_index];
+                self.sticky_sender = Some((name.clone(), is_me, state.primary.y_offset, state.primary.sender_index));
+
+                // Outgoing stickies (visible sender headers below primary)
+                self.sticky_outgoing = state.outgoing.iter().map(|out| {
+                    let (ref name, is_me) = self.row_senders[out.sender_index];
+                    (name.clone(), is_me, out.y_offset, out.sender_index)
+                }).collect();
             }
             None => {
                 self.sticky_sender = None;
+                self.sticky_outgoing = vec![];
             }
         }
     }
@@ -1202,9 +1222,10 @@ impl MainScreen {
                 // With anchor_bottom, absolute_offset_reversed().y == 0 means we're at the very top
                 let dist_from_top = viewport.absolute_offset_reversed().y;
 
-                // Save scroll offset for sticky recalculation
+                // Save scroll offset and viewport height for sticky recalculation
                 // absolute_offset_reversed().y = pixels scrolled from content top
                 self.last_scroll_offset = dist_from_top;
+                self.last_viewport_height = viewport.bounds().height;
 
                 // Recalculate sticky sender using exact child positions from LayoutTracker
                 self.recalc_sticky();
@@ -1597,6 +1618,7 @@ impl MainScreen {
                 let mut last_sender: Option<&str> = None;
                 let mut last_date: Option<&str> = None;
                 let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                let mut row_idx: usize = if self.loading_older { 1 } else { 0 };
 
                 for msg in sorted_msgs.iter() {
                     // Date separator: centered line when date changes (not today)
@@ -1615,6 +1637,7 @@ impl MainScreen {
                         );
                         // Reset sender tracking after separator
                         last_sender = None;
+                        row_idx += 1;
                     }
                     last_date = Some(msg_date);
 
@@ -1630,16 +1653,17 @@ impl MainScreen {
                         Color::from_rgb(0.7, 0.85, 0.55)
                     };
 
-                    // Col 1: Sender name — only shown on sender change (group header)
-                    let name_text: Element<'_, Message> = if show_name {
-                        text(&msg.sender_name).size(12).color(name_color).into()
-                    } else {
-                        text("").into()
+                    // Col 1: Debug row index only — sender name shown via sticky overlay
+                    let name_text: Element<'_, Message> = {
+                        let label = format!("[r{}]", row_idx);
+                        text(label).size(9).color(TeamsDark::TEXT_MUTED).into()
                     };
                     let col1: Element<'_, Message> = container(name_text)
                         .width(name_col_w)
                         .padding([2, 4])
                         .into();
+
+                    row_idx += 1;
 
                     // Col 2: Time
                     let col2: Element<'_, Message> = container(
@@ -1678,38 +1702,59 @@ impl MainScreen {
                     .height(Length::Fill)
                     .anchor_bottom();
 
-                // Sticky sender name overlay with push-down effect
-                let sticky_overlay: Element<'_, Message> = if let Some((ref name, is_me, push_down)) = self.sticky_sender {
+                // Sticky sender name overlay(s) — dual sticky support
+                // During transitions, two stickies are visible simultaneously:
+                // - primary: the current sender pinned at the viewport top
+                // - outgoing: the old sender scrolling away at its natural position
+                let mut stack_children: Vec<Element<'_, Message>> = vec![msg_scrollable.into()];
+
+                // Helper: build a sticky label element at given y_offset
+                let make_sticky = |name: &str, is_me: bool, y_offset: f32, row_idx: usize, name_col_w: f32| -> Option<Element<'_, Message>> {
+                    // Don't render if pushed completely off-screen (above viewport)
+                    if y_offset < -30.0 {
+                        return None;
+                    }
                     let color = if is_me {
                         Color::from_rgb(0.55, 0.65, 1.0)
                     } else {
                         Color::from_rgb(0.7, 0.85, 0.55)
                     };
-                    // Top padding = column padding (12) + push_down from incoming header
-                    let top_pad = 12.0 + push_down;
-                    container(
+                    let top_pad = y_offset.max(0.0);
+                    let sticky_label = format!("{} [r{}]", name, row_idx);
+                    Some(
                         container(
-                            text(name).size(12).color(color)
+                            container(
+                                text(sticky_label).size(12).color(color)
+                            )
+                            .width(name_col_w)
+                            .padding([2, 4])
+                            .style(|_theme: &iced::Theme| container::Style {
+                                background: Some(iced::Background::Color(TeamsDark::BACKGROUND)),
+                                ..Default::default()
+                            })
                         )
-                        .width(name_col_w)
-                        .padding([2, 4])
-                        .style(|_theme: &iced::Theme| container::Style {
-                            background: Some(iced::Background::Color(TeamsDark::BACKGROUND)),
-                            ..Default::default()
-                        })
+                        .padding(iced::Padding::ZERO.top(top_pad).left(12.0))
+                        .width(Length::Fill)
+                        .align_top(Length::Fill)
+                        .into()
                     )
-                    .padding(iced::Padding::ZERO.top(top_pad).left(12.0))
-                    .width(Length::Fill)
-                    .align_top(Length::Fill)
-                    .into()
-                } else {
-                    container("").width(0).height(0).into()
                 };
 
-                iced::widget::Stack::with_children(vec![
-                    msg_scrollable.into(),
-                    sticky_overlay,
-                ])
+                // Primary sticky (current sender, may be pushed down by incoming)
+                if let Some((ref name, is_me, y_offset, row_idx)) = self.sticky_sender {
+                    if let Some(el) = make_sticky(name, is_me, y_offset, row_idx, name_col_w) {
+                        stack_children.push(el);
+                    }
+                }
+
+                // Outgoing stickies (sender headers scrolling with content)
+                for (ref name, is_me, y_offset, row_idx) in &self.sticky_outgoing {
+                    if let Some(el) = make_sticky(name, *is_me, *y_offset, *row_idx, name_col_w) {
+                        stack_children.push(el);
+                    }
+                }
+
+                iced::widget::Stack::with_children(stack_children)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -3206,7 +3251,8 @@ mod tests {
             make_msg("Bob", false, "2026-04-07T10:00:00Z"),
         ];
         let counts = compute_date_separator_counts(&msgs);
-        // First date change happens at index 2 (2026-04-06 → 2026-04-07)
-        assert_eq!(counts, vec![0, 0, 1, 1]);
+        // First message is not today → separator before it (count=1 from msg 0).
+        // Date changes again at index 2 (2026-04-06 → 2026-04-07) → count=2.
+        assert_eq!(counts, vec![1, 1, 2, 2]);
     }
 }
