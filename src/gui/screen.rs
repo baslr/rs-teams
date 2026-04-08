@@ -1535,12 +1535,21 @@ fn parse_chats(val: &serde_json::Value, my_user_id: &str) -> Vec<ChatEntry> {
             };
 
             // Get display name
+            // For channels (space): use topicThreadTopic (= channel name)
+            // spaceThreadTopic is the parent team name, not the channel name
+            let channel_topic = conv.get("threadProperties")
+                .and_then(|tp| tp.get("topicThreadTopic"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+
             let topic = conv.get("threadProperties")
                 .and_then(|tp| tp.get("topic"))
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
 
-            let name = if !topic.is_empty() {
+            let name = if !channel_topic.is_empty() {
+                channel_topic.to_string()
+            } else if !topic.is_empty() {
                 topic.to_string()
             } else if let Some(members) = conv.get("members").and_then(|m| m.as_array()) {
                 // Try getting names from members list
@@ -1939,6 +1948,51 @@ mod tests {
         assert!(chats[0].unread_count > 0, "chat with newer messages should be unread");
         assert_eq!(chats[0].read_horizon_id, 100);
         assert_eq!(chats[1].unread_count, 0, "chat with no new messages should be read");
+    }
+
+    // ── parse_chats: channel name ──────────────────────────────────
+
+    #[test]
+    fn parse_chats_space_uses_topic_thread_topic() {
+        let json = serde_json::json!({
+            "conversations": [{
+                "id": "19:abc@thread.tacv2",
+                "lastUpdatedMessageId": 100,
+                "threadProperties": {
+                    "threadType": "space",
+                    "topic": "",
+                    "spaceThreadTopic": "Parent Team Name",
+                    "topicThreadTopic": "My Channel Name"
+                },
+                "properties": { "consumptionhorizon": "100;100;100" },
+                "members": []
+            }]
+        });
+        let chats = parse_chats(&json, "8:orgid:me");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].display_name, "📌 My Channel Name");
+    }
+
+    #[test]
+    fn parse_chats_space_ignores_last_message_sender() {
+        let json = serde_json::json!({
+            "conversations": [{
+                "id": "19:abc@thread.tacv2",
+                "lastUpdatedMessageId": 100,
+                "threadProperties": {
+                    "threadType": "space",
+                    "topic": "",
+                    "spaceThreadTopic": "Team Name",
+                    "topicThreadTopic": "Engineering Team"
+                },
+                "properties": { "consumptionhorizon": "100;100;100" },
+                "members": [{"id": "8:orgid:other", "friendlyName": "Doe, Jane"}],
+                "lastMessage": { "imdisplayname": "Doe, Jane" }
+            }]
+        });
+        let chats = parse_chats(&json, "8:orgid:me");
+        assert_eq!(chats[0].display_name, "📌 Engineering Team",
+            "space should use topicThreadTopic, not lastMessage sender");
     }
 
     // ── build_sidebar_sections ────────────────────────────────────

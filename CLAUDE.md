@@ -90,6 +90,15 @@ container("").width(3).height(20)
 - `absolute_offset_reversed().y` → `0` = ganz oben (älteste Messages sichtbar)
 - `on_scroll(Message::ScrollChanged)` liefert `Viewport` mit diesen Werten
 
+### Teams Chat Service API — Channel-Namen (threadType=space)
+
+- Channels haben `threadType: "space"` und `topic: ""` (immer leer!)
+- `spaceThreadTopic` = **Team**-Name (z.B. "My Team")
+- `topicThreadTopic` = **Channel**-Name (z.B. "General")
+- `topics` = JSON-Array mit Sub-Channels (name + id)
+- Für die Sidebar immer `topicThreadTopic` verwenden, NICHT `spaceThreadTopic`
+- Fallback: `topic` → members → lastMessage.imdisplayname
+
 ### Teams Chat Service API — Pagination
 
 - `_metadata.backwardLink` = absolute URL für die nächste ältere Seite
