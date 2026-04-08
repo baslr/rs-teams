@@ -1,21 +1,36 @@
 //! CSA (Chat Service Aggregator) API types and methods.
 //!
-//! Endpoint: GET /api/csa/{mt_region}/api/v3/teams/users/me/updates
+//! Endpoint: GET /api/csa/{mt_region}/api/v3/teams/users/me
 //! Token audience: https://chatsvcagg.teams.microsoft.com
 //!
 //! This endpoint returns chat folders, teams, chats, and a sync token
 //! for delta synchronization.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::api::client::GraphClient;
 use crate::error::AppError;
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Deserialize a `null` JSON value as `Default::default()` (e.g. `""` for String).
+/// Combines with `#[serde(default)]` to handle both missing fields and explicit nulls.
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
 // Response types
 // ---------------------------------------------------------------------------
 
-/// Top-level response from /api/csa/.../api/v3/teams/users/me/updates
+/// Top-level response from /api/csa/.../api/v3/teams/users/me
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CsaUpdatesResponse {
@@ -60,16 +75,31 @@ pub struct CsaFolder {
     #[serde(default)]
     pub version: u64,
     #[serde(default)]
-    pub conversations: Vec<CsaFolderConversation>,
+    pub conversation_folder_items: Vec<CsaFolderItem>,
 }
 
-/// A conversation reference inside a folder
+impl CsaFolder {
+    /// Convenience: iterate over conversation IDs in this folder
+    pub fn conversation_ids(&self) -> impl Iterator<Item = &str> {
+        self.conversation_folder_items
+            .iter()
+            .map(|i| i.conversation_id.as_str())
+    }
+}
+
+/// A conversation/item reference inside a folder
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CsaFolderConversation {
-    pub id: String,
+pub struct CsaFolderItem {
+    pub conversation_id: String,
     #[serde(default)]
     pub thread_type: String,
+    #[serde(default)]
+    pub item_type: String,
+    #[serde(default)]
+    pub created_time: u64,
+    #[serde(default)]
+    pub last_updated_time: u64,
 }
 
 /// Sync metadata
@@ -129,20 +159,24 @@ pub struct CsaMember {
 }
 
 /// Last message in a CSA chat — contains sender display name inline
+///
+/// Note: many fields can be `null` in the real API, even though they look like
+/// they should always be strings. We use `deserialize_null_default` to coerce
+/// `null` → `""` so callers don't have to deal with Option everywhere.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CsaLastMessage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub im_display_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub content: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub compose_time: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub message_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub from: String,
 }
 
@@ -163,16 +197,15 @@ pub struct CsaConsumptionHorizon {
 // ---------------------------------------------------------------------------
 
 impl GraphClient {
-    /// Fetch conversation folders from the CSA updates endpoint.
+    /// Fetch conversation folders from the CSA endpoint.
     ///
     /// Uses the chatsvcagg token (audience: https://chatsvcagg.teams.microsoft.com).
-    /// Returns folder definitions and folder display order.
+    /// Returns folder definitions, folder display order, and chats.
     pub async fn get_folders(&self) -> Result<CsaUpdatesResponse, AppError> {
         self.get_csa(
-            "api/v3/teams/users/me/updates\
+            "api/v3/teams/users/me\
              ?isPrefetch=false\
              &enableMembershipSummary=true\
-             &migratePinnedToFavorites=true\
              &supportsAdditionalSystemGeneratedFolders=true\
              &supportsSliceItems=true\
              &enableEngageCommunities=false",
@@ -212,7 +245,7 @@ mod tests {
         }
     }"#;
 
-    /// Simulated full-sync response with folder details
+    /// Simulated full-sync response with folder details (matches real API format)
     const FULL_RESPONSE: &str = r#"{
         "conversationFolders": {
             "folderHierarchyVersion": 1775588983643,
@@ -225,9 +258,9 @@ mod tests {
                     "isExpanded": true,
                     "isDeleted": false,
                     "version": 1775588983643,
-                    "conversations": [
-                        {"id": "19:abc@thread.v2", "threadType": "chat"},
-                        {"id": "19:def@thread.v2", "threadType": "meeting"}
+                    "conversationFolderItems": [
+                        {"conversationId": "19:abc@thread.v2", "threadType": "chat", "createdTime": 100, "lastUpdatedTime": 200},
+                        {"conversationId": "19:def@thread.v2", "threadType": "meeting", "createdTime": 300, "lastUpdatedTime": 400}
                     ]
                 },
                 {
@@ -238,7 +271,7 @@ mod tests {
                     "isExpanded": false,
                     "isDeleted": false,
                     "version": 123,
-                    "conversations": []
+                    "conversationFolderItems": []
                 }
             ],
             "conversationFolderOrder": [
@@ -295,14 +328,16 @@ mod tests {
         assert!(folder.is_expanded);
         assert!(!folder.is_deleted);
         assert_eq!(folder.version, 1775588983643);
-        assert_eq!(folder.conversations.len(), 2);
-        assert_eq!(folder.conversations[0].id, "19:abc@thread.v2");
-        assert_eq!(folder.conversations[0].thread_type, "chat");
-        assert_eq!(folder.conversations[1].thread_type, "meeting");
+        assert_eq!(folder.conversation_folder_items.len(), 2);
+        assert_eq!(folder.conversation_folder_items[0].conversation_id, "19:abc@thread.v2");
+        assert_eq!(folder.conversation_folder_items[0].thread_type, "chat");
+        assert_eq!(folder.conversation_folder_items[0].created_time, 100);
+        assert_eq!(folder.conversation_folder_items[1].thread_type, "meeting");
+        assert_eq!(folder.conversation_folder_items[1].last_updated_time, 400);
 
         let favs = &folders.conversation_folders[1];
         assert_eq!(favs.folder_type, "Favorites");
-        assert!(favs.conversations.is_empty());
+        assert!(favs.conversation_folder_items.is_empty());
     }
 
     #[test]
@@ -342,7 +377,7 @@ mod tests {
         assert!(!f.is_expanded);
         assert!(!f.is_deleted);
         assert_eq!(f.version, 0);
-        assert!(f.conversations.is_empty());
+        assert!(f.conversation_folder_items.is_empty());
     }
 
     // ── CsaChat deserialization ───────────────────────────────────
@@ -439,5 +474,43 @@ mod tests {
         let json = r#"{"metadata": {"syncToken": "tok"}}"#;
         let resp: CsaUpdatesResponse = serde_json::from_str(json).unwrap();
         assert!(resp.chats.is_empty());
+    }
+
+    #[test]
+    fn parse_real_api_response_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/api_explore_csa_me.json");
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("Skipping test: {path} not found");
+                return;
+            }
+        };
+
+        match serde_json::from_str::<CsaUpdatesResponse>(&content) {
+            Ok(resp) => {
+                if let Some(folders) = &resp.conversation_folders {
+                    assert!(!folders.conversation_folders.is_empty(), "Expected folders");
+                }
+                assert!(!resp.chats.is_empty(), "Expected chats");
+            }
+            Err(e) => {
+                // Show detailed context around the error
+                let line = e.line();
+                let col = e.column();
+                let lines: Vec<&str> = content.lines().collect();
+                let error_line = if line > 0 && line <= lines.len() {
+                    lines[line - 1]
+                } else {
+                    ""
+                };
+                let start = col.saturating_sub(60);
+                let end = (col + 60).min(error_line.len());
+                let context = &error_line[start..end];
+                panic!(
+                    "Parse error at line {line} col {col}: {e}\n  context: ...{context}..."
+                );
+            }
+        }
     }
 }

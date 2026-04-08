@@ -298,6 +298,27 @@ impl GraphClient {
             return Err(AppError::Http(status, body));
         }
 
-        Ok(resp.json::<T>().await?)
+        // Read body as text first, then parse — gives precise error messages
+        let body = resp.text().await.map_err(reqwest::Error::from)?;
+        match serde_json::from_str::<T>(&body) {
+            Ok(parsed) => Ok(parsed),
+            Err(e) => {
+                // Log the exact position and context around the error
+                let line = e.line();
+                let col = e.column();
+                // For single-line JSON, show chars around the error position
+                let start = col.saturating_sub(80);
+                let end = (col + 80).min(body.len());
+                let context = if body.len() > 200 {
+                    &body[start..end.min(body.len())]
+                } else {
+                    &body
+                };
+                tracing::error!(
+                    "CSA JSON parse error at line {line} col {col}: {e}\n  context: ...{context}..."
+                );
+                Err(AppError::Json(e))
+            }
+        }
     }
 }

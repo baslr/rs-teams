@@ -218,12 +218,10 @@ pub fn login_with_browser_sync() -> Result<BrowserSession, AppError> {
                 // Re-inject interceptor in case page navigated
                 let _ = tab.evaluate(js_intercept, true);
 
-                // Extract chat folders from IndexedDB
-                let (chat_folders, folder_order) = extract_chat_folders(&tab);
-                debug_log(&format!("Extracted {} chat folders", chat_folders.len()));
-                let mut session = session;
-                session.chat_folders = chat_folders;
-                session.folder_order = folder_order;
+                // IndexedDB folder scraping disabled — folders now come from CSA API
+                // let (chat_folders, folder_order) = extract_chat_folders(&tab);
+                // session.chat_folders = chat_folders;
+                // session.folder_order = folder_order;
 
                 // TEST: Make a direct fetch call from the browser to test the API
                 // Use the chatsvcagg token (not ic3) for conversations endpoint

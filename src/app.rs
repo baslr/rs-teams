@@ -1,7 +1,7 @@
 use iced::{Element, Subscription, Task};
 
 use crate::api::client::GraphClient;
-use crate::api::csa::{CsaFolder, CsaFolderConversation};
+use crate::api::csa::CsaFolder;
 use crate::gui::login::{self, LoginScreen};
 use crate::gui::screen::{self, MainScreen};
 
@@ -53,35 +53,16 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                         session.chat_service_url.clone(),
                     );
 
-                    // Convert BrowserSession ChatFolders → CsaFolder for the GUI
-                    let initial_folders: Vec<CsaFolder> = session
-                        .chat_folders
-                        .iter()
-                        .map(|f| CsaFolder {
-                            id: f.id.clone(),
-                            name: f.name.clone(),
-                            folder_type: f.folder_type.clone(),
-                            sort_type: f.sort_type.clone(),
-                            is_expanded: f.is_expanded,
-                            is_deleted: f.is_deleted,
-                            version: f.version,
-                            conversations: f
-                                .conversation_ids
-                                .iter()
-                                .map(|cid| CsaFolderConversation {
-                                    id: cid.clone(),
-                                    thread_type: String::new(),
-                                })
-                                .collect(),
-                        })
-                        .collect();
+                    // Folders come from the CSA endpoint now, not from browser scraping
+                    let initial_folders: Vec<CsaFolder> = vec![];
+                    let folder_order: Vec<String> = vec![];
 
                     let (main, task) = MainScreen::new(
                         client,
                         session.display_name.clone(),
                         session.user_id.clone(),
                         initial_folders,
-                        session.folder_order.clone(),
+                        folder_order,
                     );
                     app.screen = Screen::Main(main);
                     task.map(Message::Main)

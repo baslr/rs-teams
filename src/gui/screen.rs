@@ -6,7 +6,7 @@ use iced::{Color, Element, Font, Length, Subscription, Task};
 use crate::gui::layout_tracker::{self, ChildPositions, LayoutTracker};
 
 use crate::api::client::GraphClient;
-use crate::api::csa::{CsaChat, CsaFolder, CsaFolderConversation, CsaLastMessage, CsaMember};
+use crate::api::csa::{CsaChat, CsaFolder, CsaFolderItem, CsaLastMessage, CsaMember};
 use crate::api::csa::CsaUpdatesResponse;
 use crate::error::AppError;
 use crate::gui::style::TeamsDark;
@@ -222,9 +222,9 @@ pub fn build_sidebar_sections(
         );
 
         let conv_ids: HashSet<&str> = folder
-            .conversations
+            .conversation_folder_items
             .iter()
-            .map(|c| c.id.as_str())
+            .map(|c| c.conversation_id.as_str())
             .collect();
 
         let mut chat_indices: Vec<usize> = Vec::new();
@@ -380,8 +380,8 @@ pub fn fill_missing_folder_chats(
         if folder.is_deleted {
             continue;
         }
-        for conv in &folder.conversations {
-            if !existing_ids.contains(&conv.id) {
+        for conv in &folder.conversation_folder_items {
+            if !existing_ids.contains(&conv.conversation_id) {
                 let prefix = match conv.thread_type.as_str() {
                     "chat" => "💬 ",
                     "meeting" => "📅 ",
@@ -390,8 +390,8 @@ pub fn fill_missing_folder_chats(
                     _ => "💬 ",
                 };
                 chats.push(ChatEntry {
-                    id: conv.id.clone(),
-                    display_name: format!("{prefix}{}", short_id(&conv.id)),
+                    id: conv.conversation_id.clone(),
+                    display_name: format!("{prefix}{}", short_id(&conv.conversation_id)),
                     unread_count: 0,
                     read_horizon_id: 0,
                 });
@@ -717,12 +717,12 @@ impl MainScreen {
                         "  Folder '{}' ({}): {} conversations, type={}, deleted={}",
                         folder.name,
                         folder.id,
-                        folder.conversations.len(),
+                        folder.conversation_folder_items.len(),
                         folder.folder_type,
                         folder.is_deleted
                     );
-                    for conv in &folder.conversations {
-                        tracing::debug!("    conv: {} (type={})", conv.id, conv.thread_type);
+                    for conv in &folder.conversation_folder_items {
+                        tracing::debug!("    conv: {} (type={})", conv.conversation_id, conv.thread_type);
                     }
                 }
 
@@ -742,19 +742,19 @@ impl MainScreen {
 
                 // Log folder→chat matching
                 for folder in &self.folders {
-                    let matched: Vec<&str> = folder.conversations.iter()
-                        .filter(|c| self.chats.iter().any(|ch| ch.id == c.id))
-                        .map(|c| c.id.as_str())
+                    let matched: Vec<&str> = folder.conversation_folder_items.iter()
+                        .filter(|c| self.chats.iter().any(|ch| ch.id == c.conversation_id))
+                        .map(|c| c.conversation_id.as_str())
                         .collect();
-                    let missing: Vec<&str> = folder.conversations.iter()
-                        .filter(|c| !self.chats.iter().any(|ch| ch.id == c.id))
-                        .map(|c| c.id.as_str())
+                    let missing: Vec<&str> = folder.conversation_folder_items.iter()
+                        .filter(|c| !self.chats.iter().any(|ch| ch.id == c.conversation_id))
+                        .map(|c| c.conversation_id.as_str())
                         .collect();
                     tracing::info!(
                         "  Folder '{}': {}/{} matched, {} missing",
                         folder.name,
                         matched.len(),
-                        folder.conversations.len(),
+                        folder.conversation_folder_items.len(),
                         missing.len()
                     );
                     for m in &missing {
@@ -832,20 +832,20 @@ impl MainScreen {
 
                     // Log folder matching AFTER merge
                     for folder in &self.folders {
-                        let matched: Vec<&str> = folder.conversations.iter()
-                            .filter(|c| self.chats.iter().any(|ch| ch.id == c.id))
-                            .map(|c| c.id.as_str())
+                        let matched: Vec<&str> = folder.conversation_folder_items.iter()
+                            .filter(|c| self.chats.iter().any(|ch| ch.id == c.conversation_id))
+                            .map(|c| c.conversation_id.as_str())
                             .collect();
-                        let missing: Vec<&str> = folder.conversations.iter()
-                            .filter(|c| !self.chats.iter().any(|ch| ch.id == c.id))
-                            .map(|c| c.id.as_str())
+                        let missing: Vec<&str> = folder.conversation_folder_items.iter()
+                            .filter(|c| !self.chats.iter().any(|ch| ch.id == c.conversation_id))
+                            .map(|c| c.conversation_id.as_str())
                             .collect();
                         if !missing.is_empty() {
                             tracing::warn!(
                                 "After merge — Folder '{}': {}/{} matched, {} STILL MISSING: {:?}",
                                 folder.name,
                                 matched.len(),
-                                folder.conversations.len(),
+                                folder.conversation_folder_items.len(),
                                 missing.len(),
                                 missing
                             );
@@ -853,8 +853,8 @@ impl MainScreen {
                             tracing::info!(
                                 "After merge — Folder '{}': {}/{} all matched",
                                 folder.name,
-                                folder.conversations.len(),
-                                folder.conversations.len()
+                                folder.conversation_folder_items.len(),
+                                folder.conversation_folder_items.len()
                             );
                         }
                     }
@@ -2297,11 +2297,14 @@ mod tests {
             is_expanded: true,
             is_deleted: false,
             version: 1,
-            conversations: conv_ids
+            conversation_folder_items: conv_ids
                 .into_iter()
-                .map(|cid| CsaFolderConversation {
-                    id: cid.to_string(),
+                .map(|cid| CsaFolderItem {
+                    conversation_id: cid.to_string(),
                     thread_type: "chat".to_string(),
+                    item_type: String::new(),
+                    created_time: 0,
+                    last_updated_time: 0,
                 })
                 .collect(),
         }
@@ -2790,7 +2793,7 @@ mod tests {
     fn fill_missing_placeholder_has_thread_type_prefix() {
         let mut chats: Vec<ChatEntry> = vec![];
         let mut folder = make_folder("f1", "Mixed", vec!["19:aaa@thread.v2"]);
-        folder.conversations[0].thread_type = "meeting".to_string();
+        folder.conversation_folder_items[0].thread_type = "meeting".to_string();
 
         fill_missing_folder_chats(&mut chats, &[folder]);
 
