@@ -49,21 +49,23 @@ Stattdessen: Descriptor-basiertes Matching über cosmic_text's fontdb.
 
 **Aktuelle Konfiguration** (funktioniert!):
 ```
-fonts/FiraSans-Regular.ttf       → family="Fira Sans", subfamily="Regular"
-fonts/FiraSans-Bold-Renamed.ttf  → family="Fira Sans Bold", subfamily="Regular"
+fonts/FiraSans-Regular.ttf  → family="Fira Sans", subfamily="Regular", weight=400
+fonts/FiraSans-Bold.ttf     → family="Fira Sans", subfamily="Bold", weight=700
 ```
-- Regular: `Font::with_name("Fira Sans")` → O(1) Match
-- Bold: `Font::with_name("Fira Sans Bold")` → O(1) Match (eigene Family!)
+- Regular: `Font::with_name("Fira Sans")` → matcht weight=Normal (default)
+- Bold: `Font { family: Name("Fira Sans"), weight: Bold, stretch: Normal, style: Normal }` → matcht weight=700
 
-**WARUM die umbenannte Bold-Font**: Die originale FiraSans-Bold.ttf hat family="Fira Sans" + subfamily="Bold".
-Mit `Font { family: Name("Fira Sans"), weight: Bold }` SOLLTE das matchen — tut es aber nicht zuverlässig.
-Die Lösung: Bold-Font umbenannt (via fonttools) auf family="Fira Sans Bold" + subfamily="Regular".
-So wird sie über `Font::with_name("Fira Sans Bold")` direkt per Family-Name gefunden, ohne Weight-Matching.
+**WICHTIG**: Alle 4 Felder explizit setzen! `Font::with_name("Fira Sans")` setzt nur family,
+die anderen Felder bleiben Normal — das matcht Regular. Für Bold MUSS `weight: Bold` explizit gesetzt werden.
+
+**NICHT FUNKTIONIERT**: `Font::with_name("Fira Sans Bold")` mit umbenannter TTF (subfamily="Regular").
+Die Glyphen werden zwar gefunden, aber iced/cosmic_text rendert sie trotzdem nicht bold.
+Weight-Matching über die originale Bold-Font ist der richtige Weg.
 
 **WICHTIG — NIE MACHEN**:
 - `Font::DEFAULT` oder `..Default::default()` → family wird `SansSerif` → mappt auf "Open Sans" → Fallback-Chaos
 - `Family::SansSerif` irgendwo verwenden → gleiches Problem
-- Immer `Font::with_name("Fira Sans")` bzw. `Font::with_name("Fira Sans Bold")` explizit angeben
+- Immer explizit `Family::Name("Fira Sans")` angeben
 
 ### iced 0.14 Layout — height(Length::Fill) in Rows ist gefährlich
 

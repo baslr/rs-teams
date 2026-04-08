@@ -20,7 +20,7 @@ fn main() -> iced::Result {
         .theme(app::theme)
         .subscription(app::subscription)
         .font(include_bytes!("../fonts/FiraSans-Regular.ttf").as_slice())
-        .font(include_bytes!("../fonts/FiraSans-Bold-Renamed.ttf").as_slice())
+        .font(include_bytes!("../fonts/FiraSans-Bold.ttf").as_slice())
         .window_size((1200.0, 800.0))
         .run()
 }

@@ -1110,7 +1110,12 @@ impl MainScreen {
         // Do NOT use weight: Bold — iced 0.14 renders it invisible.
         // Instead, reference the bold TTF directly by its fullname as family.
         let name_font = if props.bold {
-            Font::with_name("Fira Sans Bold")
+            iced::Font {
+                family: iced::font::Family::Name("Fira Sans"),
+                weight: iced::font::Weight::Bold,
+                stretch: iced::font::Stretch::Normal,
+                style: iced::font::Style::Normal,
+            }
         } else {
             Font::with_name("Fira Sans")
         };
