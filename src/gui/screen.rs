@@ -517,8 +517,8 @@ pub struct MainScreen {
     sender_groups: Vec<SenderGroup>,
     /// Precomputed date separator counts per message index
     date_separator_counts: Vec<usize>,
-    /// Currently sticky sender (name, is_from_me) — shown as overlay
-    sticky_sender: Option<(String, bool)>,
+    /// Currently sticky sender: (name, is_from_me, push_down_px)
+    sticky_sender: Option<(String, bool, f32)>,
     /// Last known absolute scroll offset (pixels from top of content)
     last_scroll_offset: f32,
     /// Shared child Y positions from LayoutTracker widget
@@ -650,40 +650,25 @@ impl MainScreen {
     }
 
     /// Recalculate sticky sender using EXACT child positions from LayoutTracker.
-    /// `child_positions` has the real Y-offset of each child in the Column.
-    /// `last_scroll_offset` has the scrollable's absolute offset (pixels from top).
-    /// Combined, we find exactly which row is at the viewport top.
+    /// Uses compute_sticky_state() for the core logic including push-down effect.
     fn recalc_sticky(&mut self) {
         let positions = self.child_positions.borrow();
-        if positions.is_empty() || self.row_senders.is_empty() {
-            self.sticky_sender = None;
-            return;
-        }
 
-        // Find the topmost visible child
-        let top_idx = match layout_tracker::top_visible_child(&positions, self.last_scroll_offset) {
-            Some(idx) => idx,
-            None => { self.sticky_sender = None; return; }
-        };
-
-        // Don't show sticky if we're at the very top
-        if top_idx == 0 && self.last_scroll_offset < 5.0 {
-            self.sticky_sender = None;
-            return;
-        }
-
-        // Walk backwards from top_idx to find the sender
-        // (skip date separators which have empty sender_name)
-        let limit = top_idx.min(self.row_senders.len().saturating_sub(1));
-        for i in (0..=limit).rev() {
-            let (ref name, is_me) = self.row_senders[i];
-            if !name.is_empty() {
-                self.sticky_sender = Some((name.clone(), is_me));
-                return;
+        let sticky_height = 20.0; // approximate height of the sticky label (12px text + padding)
+        match layout_tracker::compute_sticky_state(
+            &positions,
+            &self.row_senders,
+            self.last_scroll_offset,
+            sticky_height,
+        ) {
+            Some(state) => {
+                let (ref name, is_me) = self.row_senders[state.sender_index];
+                self.sticky_sender = Some((name.clone(), is_me, state.push_down));
+            }
+            None => {
+                self.sticky_sender = None;
             }
         }
-
-        self.sticky_sender = None;
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -1693,13 +1678,15 @@ impl MainScreen {
                     .height(Length::Fill)
                     .anchor_bottom();
 
-                // Sticky sender name overlay
-                let sticky_overlay: Element<'_, Message> = if let Some((ref name, is_me)) = self.sticky_sender {
+                // Sticky sender name overlay with push-down effect
+                let sticky_overlay: Element<'_, Message> = if let Some((ref name, is_me, push_down)) = self.sticky_sender {
                     let color = if is_me {
                         Color::from_rgb(0.55, 0.65, 1.0)
                     } else {
                         Color::from_rgb(0.7, 0.85, 0.55)
                     };
+                    // Top padding = column padding (12) + push_down from incoming header
+                    let top_pad = 12.0 + push_down;
                     container(
                         container(
                             text(name).size(12).color(color)
@@ -1711,7 +1698,7 @@ impl MainScreen {
                             ..Default::default()
                         })
                     )
-                    .padding(12)
+                    .padding(iced::Padding::ZERO.top(top_pad).left(12.0))
                     .width(Length::Fill)
                     .align_top(Length::Fill)
                     .into()
