@@ -1,18 +1,15 @@
-# Zuerst alles ignorieren
+# 1. Alles ignorieren
 *
 
-# Die .DS_Store explizit ignorieren (auch wenn * das schon abdeckt)
-.DS_Store
-
-# Den Ordner src/ von der globalen Sperre ausnehmen, damit Git reinschaut
+# 2. Verzeichnisse in src/ begehbar machen
 !src/
+!src/**/
 
-# Alle Dateien innerhalb von src/bin/ ignorieren
-src/bin/*
+# 3. Den Ordner src/bin/ wieder strikt ausschließen
+src/bin/
 
-# Falls src/bin/ Unterverzeichnisse hat, die auch ignoriert werden sollen:
-# src/bin/**
-
-# Alle .rs Dateien in src/ (und Unterverzeichnissen) wieder einschließen
+# 4. Alle .rs Dateien (außer in den eben ausgeschlossenen Ordnern) freigeben
 !src/**/*.rs
 
+# 5. Sonstiges
+.DS_Store

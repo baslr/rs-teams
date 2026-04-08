@@ -13,12 +13,6 @@ impl GraphClient {
         self.get_graph(&format!("{GRAPH_BASE}/me")).await
     }
 
-    /// List recent chats/conversations
-    /// Uses Chat Service API with ic3 token: /api/chatsvc/{region}/v1/users/ME/conversations
-    pub async fn list_chats(&self) -> Result<serde_json::Value, AppError> {
-        self.get_chatsvc("v1/users/ME/conversations?view=msnp24Equivalent&pageSize=50").await
-    }
-
     /// Load ALL chats by paging through the chatsvc conversations endpoint.
     /// Returns a single JSON value with all conversations merged into one array.
     pub async fn list_all_chats(&self) -> Result<serde_json::Value, AppError> {

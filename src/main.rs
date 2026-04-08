@@ -6,6 +6,7 @@ mod auth;
 mod error;
 mod gui;
 mod models;
+mod utils;
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
@@ -16,7 +17,7 @@ fn main() -> iced::Result {
         .init();
 
     iced::application(app::boot, app::update, app::view)
-        .title("Teams")
+        .title("RS Teams")
         .theme(app::theme)
         .subscription(app::subscription)
         .font(include_bytes!("../fonts/FiraSans-Regular.ttf").as_slice())

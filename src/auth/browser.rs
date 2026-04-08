@@ -9,6 +9,8 @@ use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::utils::time;
+
 use crate::error::AppError;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
@@ -17,7 +19,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2000);
 const DEBUG_LOG: &str = "browser_debug.log";
 
 fn debug_log(msg: &str) {
-    let timestamp = chrono::Local::now().format("%H:%M:%S%.3f");
+    let timestamp = time::get_now_formatted();
     let line = format!("[{timestamp}] {msg}\n");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -87,7 +89,8 @@ pub fn login_with_browser_sync() -> Result<BrowserSession, AppError> {
     let browser = Browser::new(options)
         .map_err(|e| AppError::Auth(format!("Could not start Chrome: {e}")))?;
 
-    let tab = browser.new_tab()
+    let tab = browser
+        .new_tab()
         .map_err(|e| AppError::Auth(format!("Could not open tab: {e}")))?;
 
     // Install fetch/XHR/WebSocket interceptor to capture all API calls
@@ -178,13 +181,17 @@ pub fn login_with_browser_sync() -> Result<BrowserSession, AppError> {
     thread::sleep(Duration::from_millis(500));
     let _ = tab.evaluate(js_intercept, true);
 
-    debug_log(&format!("Waiting for login (max {}s)...", LOGIN_TIMEOUT.as_secs()));
+    debug_log(&format!(
+        "Waiting for login (max {}s)...",
+        LOGIN_TIMEOUT.as_secs()
+    ));
     let deadline = Instant::now() + LOGIN_TIMEOUT;
 
     loop {
         if Instant::now() > deadline {
             return Err(AppError::Auth(format!(
-                "Login timeout after {}s", LOGIN_TIMEOUT.as_secs()
+                "Login timeout after {}s",
+                LOGIN_TIMEOUT.as_secs()
             )));
         }
 
@@ -240,9 +247,7 @@ pub fn login_with_browser_sync() -> Result<BrowserSession, AppError> {
 }
 
 /// Extract the api.spaces.skype.com token + graph token + user info from localStorage
-fn try_extract_session(
-    tab: &headless_chrome::Tab,
-) -> Result<BrowserSession, AppError> {
+fn try_extract_session(tab: &headless_chrome::Tab) -> Result<BrowserSession, AppError> {
     let js = r#"
     (function() {
         try {
@@ -405,18 +410,28 @@ fn try_extract_session(
     })()
     "#;
 
-    let result = tab.evaluate(js, true)
+    let result = tab
+        .evaluate(js, true)
         .map_err(|e| AppError::Auth(format!("JS eval failed: {e}")))?;
 
-    let json_str = result.value.as_ref()
+    let json_str = result
+        .value
+        .as_ref()
         .and_then(|v| v.as_str())
         .unwrap_or("{}");
 
-    let parsed: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| AppError::Auth(format!("Parse failed: {e}")))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| AppError::Auth(format!("Parse failed: {e}")))?;
 
-    if !parsed.get("found").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let reason = parsed.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown");
+    if !parsed
+        .get("found")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let reason = parsed
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         if let Some(keys) = parsed.get("allKeys").or(parsed.get("all_keys")) {
             debug_log(&format!("All localStorage keys: {}", keys));
         }
@@ -427,31 +442,65 @@ fn try_extract_session(
         debug_log(&format!("All localStorage keys: {}", keys));
     }
 
-    let skype_spaces_token = parsed.get("spaces_token")
-        .and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let ic3_token = parsed.get("ic3_token")
-        .and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let csa_token = parsed.get("csa_token")
-        .and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let graph_token = parsed.get("graph_token")
-        .and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let region = parsed.get("region")
-        .and_then(|v| v.as_str()).unwrap_or("de").to_string();
-    let mt_region = parsed.get("mt_region")
-        .and_then(|v| v.as_str()).unwrap_or("emea").to_string();
-    let chat_service_url = parsed.get("chat_service_url")
-        .and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let display_name = parsed.get("display_name")
-        .and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let user_id = parsed.get("user_id")
-        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let skype_spaces_token = parsed
+        .get("spaces_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ic3_token = parsed
+        .get("ic3_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let csa_token = parsed
+        .get("csa_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let graph_token = parsed
+        .get("graph_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let region = parsed
+        .get("region")
+        .and_then(|v| v.as_str())
+        .unwrap_or("de")
+        .to_string();
+    let mt_region = parsed
+        .get("mt_region")
+        .and_then(|v| v.as_str())
+        .unwrap_or("emea")
+        .to_string();
+    let chat_service_url = parsed
+        .get("chat_service_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let display_name = parsed
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let user_id = parsed
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-    let expires_ts = parsed.get("spaces_expires")
-        .and_then(|v| v.as_i64()).unwrap_or(0);
-    let expires_at = Utc.timestamp_opt(expires_ts, 0).single()
+    let expires_ts = parsed
+        .get("spaces_expires")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let expires_at = Utc
+        .timestamp_opt(expires_ts, 0)
+        .single()
         .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1));
 
-    debug_log(&format!("Spaces token found: {} chars", skype_spaces_token.len()));
+    debug_log(&format!(
+        "Spaces token found: {} chars",
+        skype_spaces_token.len()
+    ));
     debug_log(&format!("IC3 token found: {} chars", ic3_token.len()));
     debug_log(&format!("CSA token found: {} chars", csa_token.len()));
     debug_log(&format!("Region: {region}, MT region: {mt_region}"));
@@ -460,11 +509,17 @@ fn try_extract_session(
     // Extract cookies from the browser
     let cookies = match tab.get_cookies() {
         Ok(all_cookies) => {
-            let teams_cookies: Vec<(String, String)> = all_cookies.iter()
-                .filter(|c| c.domain.contains("teams.microsoft.com") || c.domain.contains(".microsoft.com"))
+            let teams_cookies: Vec<(String, String)> = all_cookies
+                .iter()
+                .filter(|c| {
+                    c.domain.contains("teams.microsoft.com") || c.domain.contains(".microsoft.com")
+                })
                 .map(|c| (c.name.clone(), c.value.clone()))
                 .collect();
-            debug_log(&format!("Extracted {} cookies from browser", teams_cookies.len()));
+            debug_log(&format!(
+                "Extracted {} cookies from browser",
+                teams_cookies.len()
+            ));
             teams_cookies
         }
         Err(e) => {
@@ -505,7 +560,9 @@ fn dump_chat_api_calls(tab: &headless_chrome::Tab) {
     "#;
 
     if let Ok(result) = tab.evaluate(js, true) {
-        let text = result.value.as_ref()
+        let text = result
+            .value
+            .as_ref()
             .and_then(|v| v.as_str())
             .unwrap_or("[]");
         debug_log("=== CHAT SERVICE API CALLS ===");
@@ -522,7 +579,9 @@ fn dump_chat_api_calls(tab: &headless_chrome::Tab) {
     "#;
 
     if let Ok(result) = tab.evaluate(js_ws, true) {
-        let text = result.value.as_ref()
+        let text = result
+            .value
+            .as_ref()
             .and_then(|v| v.as_str())
             .unwrap_or("[]");
         debug_log("=== WEBSOCKET CONNECTIONS ===");
@@ -546,7 +605,9 @@ fn dump_chat_api_calls(tab: &headless_chrome::Tab) {
     "#;
 
     if let Ok(result) = tab.evaluate(js_all, true) {
-        let text = result.value.as_ref()
+        let text = result
+            .value
+            .as_ref()
             .and_then(|v| v.as_str())
             .unwrap_or("(none)");
         debug_log("=== ALL API CALL URLs ===");
@@ -602,7 +663,9 @@ fn test_api_from_browser(tab: &headless_chrome::Tab, session: &BrowserSession) {
     "#;
 
     if let Ok(result) = tab.evaluate(js, true) {
-        let text = result.value.as_ref()
+        let text = result
+            .value
+            .as_ref()
             .and_then(|v| v.as_str())
             .unwrap_or("{}");
         debug_log("=== TRANSPORT DETECTION ===");
@@ -640,7 +703,9 @@ fn dump_skype_token_detail(tab: &headless_chrome::Tab) {
     "#;
 
     if let Ok(result) = tab.evaluate(js, true) {
-        let text = result.value.as_ref()
+        let text = result
+            .value
+            .as_ref()
             .and_then(|v| v.as_str())
             .unwrap_or("{}");
         debug_log(&format!("SKYPE-TOKEN detail: {text}"));
@@ -691,7 +756,9 @@ fn dump_auth_tokens(tab: &headless_chrome::Tab) {
     "#;
 
     if let Ok(result) = tab.evaluate(js, true) {
-        let text = result.value.as_ref()
+        let text = result
+            .value
+            .as_ref()
             .and_then(|v| v.as_str())
             .unwrap_or("{}");
         debug_log("=== AUTH TOKENS (tmp.auth.v1.*.Token.*) ===");
@@ -765,10 +832,11 @@ fn extract_chat_folders(tab: &headless_chrome::Tab) -> (Vec<ChatFolder>, Vec<Str
 
     match tab.evaluate(js, true) {
         Ok(r) => {
-            let json_str = r.value.as_ref()
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            debug_log(&format!("IDB folder raw response: {} bytes", json_str.len()));
+            let json_str = r.value.as_ref().and_then(|v| v.as_str()).unwrap_or("{}");
+            debug_log(&format!(
+                "IDB folder raw response: {} bytes",
+                json_str.len()
+            ));
 
             match serde_json::from_str::<serde_json::Value>(json_str) {
                 Ok(parsed) => {
@@ -816,15 +884,38 @@ fn parse_folder_idb_response(parsed: &serde_json::Value) -> (Vec<ChatFolder>, Ve
 
     if let Some(folder_arr) = parsed.get("folders").and_then(|v| v.as_array()) {
         for f in folder_arr {
-            let id = f.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let folder_type = f.get("folderType").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let sort_type = f.get("sortType").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let is_expanded = f.get("isExpanded").and_then(|v| v.as_bool()).unwrap_or(false);
-            let is_deleted = f.get("isDeleted").and_then(|v| v.as_bool()).unwrap_or(false);
+            let id = f
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = f
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let folder_type = f
+                .get("folderType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let sort_type = f
+                .get("sortType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let is_expanded = f
+                .get("isExpanded")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let is_deleted = f
+                .get("isDeleted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let version = f.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
 
-            let conversation_ids: Vec<String> = f.get("conversations")
+            let conversation_ids: Vec<String> = f
+                .get("conversations")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -848,7 +939,8 @@ fn parse_folder_idb_response(parsed: &serde_json::Value) -> (Vec<ChatFolder>, Ve
         }
     }
 
-    let folder_order: Vec<String> = parsed.get("folderOrder")
+    let folder_order: Vec<String> = parsed
+        .get("folderOrder")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -901,7 +993,10 @@ mod tests {
         assert!(f.is_expanded);
         assert!(!f.is_deleted);
         assert_eq!(f.version, 1775588983643);
-        assert_eq!(f.conversation_ids, vec!["19:abc@thread.v2", "19:def@thread.v2"]);
+        assert_eq!(
+            f.conversation_ids,
+            vec!["19:abc@thread.v2", "19:def@thread.v2"]
+        );
         assert_eq!(order, vec!["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"]);
     }
 
